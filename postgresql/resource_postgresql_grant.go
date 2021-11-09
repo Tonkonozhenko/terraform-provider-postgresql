@@ -638,7 +638,7 @@ func createRevokeQuery(d *schema.ResourceData) string {
 
 		if privileges.Len() == 0 || columns.Len() == 0 {
 			// No privileges to revoke, so don't revoke anything
-			query = fmt.Sprintf("SELECT NULL")
+			query = "SELECT NULL"
 		} else {
 			query = fmt.Sprintf(
 				"REVOKE %s (%s) ON TABLE %s FROM %s",
