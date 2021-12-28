@@ -243,6 +243,7 @@ var allowedPrivileges = map[string][]string{
 	"type":                 []string{"ALL", "USAGE"},
 	"foreign_data_wrapper": []string{"ALL", "USAGE"},
 	"foreign_server":       []string{"ALL", "USAGE"},
+	"column":               []string{"ALL", "SELECT", "INSERT", "UPDATE", "REFERENCES"},
 }
 
 // validatePrivileges checks that privileges to apply are allowed for this object type.
@@ -278,6 +279,14 @@ func setToPgIdentList(schema string, idents *schema.Set) string {
 			"%s.%s",
 			pq.QuoteIdentifier(schema), pq.QuoteIdentifier(ident.(string)),
 		)
+	}
+	return strings.Join(quotedIdents, ",")
+}
+
+func setToPgIdentSimpleList(idents *schema.Set) string {
+	quotedIdents := make([]string, idents.Len())
+	for i, ident := range idents.List() {
+		quotedIdents[i] = ident.(string)
 	}
 	return strings.Join(quotedIdents, ",")
 }
