@@ -142,7 +142,7 @@ func resourcePostgreSQLPolicyRead(db *DBConnection, d *schema.ResourceData) erro
 	d.Set(policySchemaAttr, policySchema)
 	d.Set(policyTableAttr, policyTable)
 	d.Set(policyToAttr, policyTo)
-	d.Set(policyUsingAttr, policyUsing[1:len(policyUsing)-1])
+	//d.Set(policyUsingAttr, policyUsing[1:len(policyUsing)-1])
 
 	return nil
 }
