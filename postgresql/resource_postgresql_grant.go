@@ -13,6 +13,8 @@ import (
 	"github.com/lib/pq"
 )
 
+const grantPathmanPartitionsAttr = "pathman_partitions"
+
 var allowedObjectTypes = []string{
 	"database",
 	"function",
@@ -83,7 +85,7 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				Set:         schema.HashString,
 				Description: "The specific columns to grant privileges on for this role",
 			},
-			"privileges": &schema.Schema{
+			"privileges": {
 				Type:        schema.TypeSet,
 				Required:    true,
 				ForceNew:    true,
@@ -97,6 +99,13 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				ForceNew:    true,
 				Default:     false,
 				Description: "Permit the grant recipient to grant it to others",
+			},
+			grantPathmanPartitionsAttr: {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				ForceNew:    true,
+				Default:     false,
+				Description: "Enable grants propagation to pathman partitions. Available only if object_type is table or columns",
 			},
 		},
 	}
@@ -180,10 +189,10 @@ func resourcePostgreSQLGrantCreate(db *DBConnection, d *schema.ResourceData) err
 		// Revoke all privileges before granting otherwise reducing privileges will not work.
 		// We just have to revoke them in the same transaction so the role will not lost its
 		// privileges between the revoke and grant statements.
-		if err := revokeRolePrivileges(txn, d); err != nil {
+		if err := revokeRolePrivileges(db, txn, d); err != nil {
 			return err
 		}
-		if err := grantRolePrivileges(txn, d); err != nil {
+		if err := grantRolePrivileges(db, txn, d); err != nil {
 			return err
 		}
 		return nil
@@ -226,7 +235,7 @@ func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) err
 	}
 
 	if err := withRolesGranted(txn, owners, func() error {
-		return revokeRolePrivileges(txn, d)
+		return revokeRolePrivileges(db, txn, d)
 	}); err != nil {
 		return err
 	}
@@ -526,163 +535,240 @@ GROUP BY pg_class.relname
 	return nil
 }
 
-func createGrantQuery(d *schema.ResourceData, privileges []string) string {
-	var query string
+func createGrantQuery(db *DBConnection, d *schema.ResourceData, privileges []string) ([]string, error) {
+	var queries []string
 
 	switch strings.ToUpper(d.Get("object_type").(string)) {
 	case "DATABASE":
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"GRANT %s ON DATABASE %s TO %s",
 			strings.Join(privileges, ","),
 			pq.QuoteIdentifier(d.Get("database").(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "SCHEMA":
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"GRANT %s ON SCHEMA %s TO %s",
 			strings.Join(privileges, ","),
 			pq.QuoteIdentifier(d.Get("schema").(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "FOREIGN_DATA_WRAPPER":
 		fdwName := d.Get("objects").(*schema.Set).List()[0]
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"GRANT %s ON FOREIGN DATA WRAPPER %s TO %s",
 			strings.Join(privileges, ","),
 			pq.QuoteIdentifier(fdwName.(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "FOREIGN_SERVER":
 		srvName := d.Get("objects").(*schema.Set).List()[0]
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"GRANT %s ON FOREIGN SERVER %s TO %s",
 			strings.Join(privileges, ","),
 			pq.QuoteIdentifier(srvName.(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "COLUMN":
-		objects := d.Get("objects").(*schema.Set)
 		columns := []string{}
 		for _, col := range d.Get("columns").(*schema.Set).List() {
 			columns = append(columns, col.(string))
 		}
-		query = fmt.Sprintf(
-			"GRANT %s (%s) ON TABLE %s TO %s",
-			strings.Join(privileges, ","),
-			strings.Join(columns, ","),
-			setToPgIdentList(d.Get("schema").(string), objects),
-			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
-	case "TABLE", "SEQUENCE", "FUNCTION":
-		objects := d.Get("objects").(*schema.Set)
-		if objects.Len() > 0 {
-			query = fmt.Sprintf(
-				"GRANT %s ON %s %s TO %s",
+
+		tablePartitions, err := tablePartitions(db, d)
+		if err != nil {
+			return nil, err
+		}
+		queries = make([]string, len(tablePartitions))
+		for i, p := range tablePartitions {
+			queries[i] = fmt.Sprintf(
+				"GRANT %s (%s) ON TABLE %s TO %s",
 				strings.Join(privileges, ","),
-				strings.ToUpper(d.Get("object_type").(string)),
-				setToPgIdentList(d.Get("schema").(string), objects),
+				strings.Join(columns, ","),
+				p,
 				pq.QuoteIdentifier(d.Get("role").(string)),
 			)
+		}
+	case "TABLE":
+		objects := d.Get("objects").(*schema.Set)
+		if objects.Len() > 0 {
+			tablePartitions, err := tablePartitions(db, d)
+			if err != nil {
+				return nil, err
+			}
+			queries = make([]string, len(tablePartitions))
+			for i, p := range tablePartitions {
+				queries[i] = fmt.Sprintf(
+					"GRANT %s ON %s %s TO %s",
+					strings.Join(privileges, ","),
+					strings.ToUpper(d.Get("object_type").(string)),
+					p,
+					pq.QuoteIdentifier(d.Get("role").(string)),
+				)
+			}
 		} else {
-			query = fmt.Sprintf(
+			queries = []string{fmt.Sprintf(
 				"GRANT %s ON ALL %sS IN SCHEMA %s TO %s",
 				strings.Join(privileges, ","),
 				strings.ToUpper(d.Get("object_type").(string)),
 				pq.QuoteIdentifier(d.Get("schema").(string)),
 				pq.QuoteIdentifier(d.Get("role").(string)),
-			)
+			)}
+		}
+	case "SEQUENCE", "FUNCTION":
+		objects := d.Get("objects").(*schema.Set)
+		if objects.Len() > 0 {
+			queries = []string{fmt.Sprintf(
+				"GRANT %s ON %s %s TO %s",
+				strings.Join(privileges, ","),
+				strings.ToUpper(d.Get("object_type").(string)),
+				setToPgIdentList(d.Get("schema").(string), objects),
+				pq.QuoteIdentifier(d.Get("role").(string)),
+			)}
+		} else {
+			queries = []string{fmt.Sprintf(
+				"GRANT %s ON ALL %sS IN SCHEMA %s TO %s",
+				strings.Join(privileges, ","),
+				strings.ToUpper(d.Get("object_type").(string)),
+				pq.QuoteIdentifier(d.Get("schema").(string)),
+				pq.QuoteIdentifier(d.Get("role").(string)),
+			)}
 		}
 	}
 
 	if d.Get("with_grant_option").(bool) {
-		query = query + " WITH GRANT OPTION"
+		for i := range queries {
+			queries[i] += " WITH GRANT OPTION"
+		}
 	}
 
-	return query
+	return queries, nil
 }
 
-func createRevokeQuery(d *schema.ResourceData) string {
-	var query string
+func createRevokeQuery(db *DBConnection, d *schema.ResourceData) ([]string, error) {
+	var queries []string
 
 	switch strings.ToUpper(d.Get("object_type").(string)) {
 	case "DATABASE":
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"REVOKE ALL PRIVILEGES ON DATABASE %s FROM %s",
 			pq.QuoteIdentifier(d.Get("database").(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "SCHEMA":
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"REVOKE ALL PRIVILEGES ON SCHEMA %s FROM %s",
 			pq.QuoteIdentifier(d.Get("schema").(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "FOREIGN_DATA_WRAPPER":
 		fdwName := d.Get("objects").(*schema.Set).List()[0]
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"REVOKE ALL PRIVILEGES ON FOREIGN DATA WRAPPER %s FROM %s",
 			pq.QuoteIdentifier(fdwName.(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "FOREIGN_SERVER":
 		srvName := d.Get("objects").(*schema.Set).List()[0]
-		query = fmt.Sprintf(
+		queries = []string{fmt.Sprintf(
 			"REVOKE ALL PRIVILEGES ON FOREIGN SERVER %s FROM %s",
 			pq.QuoteIdentifier(srvName.(string)),
 			pq.QuoteIdentifier(d.Get("role").(string)),
-		)
+		)}
 	case "COLUMN":
-		objects := d.Get("objects").(*schema.Set)
 		columns := d.Get("columns").(*schema.Set)
 		privileges := d.Get("privileges").(*schema.Set)
 
 		if privileges.Len() == 0 || columns.Len() == 0 {
 			// No privileges to revoke, so don't revoke anything
-			query = "SELECT NULL"
+			queries = []string{"SELECT NULL"}
 		} else {
-			query = fmt.Sprintf(
-				"REVOKE %s (%s) ON TABLE %s FROM %s",
-				setToPgIdentSimpleList(privileges),
-				setToPgIdentSimpleList(columns),
-				setToPgIdentList(d.Get("schema").(string), objects),
-				pq.QuoteIdentifier(d.Get("role").(string)),
-			)
+			tablePartitions, err := tablePartitions(db, d)
+			if err != nil {
+				return nil, err
+			}
+			queries = make([]string, len(tablePartitions))
+			for i, p := range tablePartitions {
+				queries[i] = fmt.Sprintf(
+					"REVOKE %s (%s) ON TABLE %s FROM %s",
+					setToPgIdentSimpleList(privileges),
+					setToPgIdentSimpleList(columns),
+					p,
+					pq.QuoteIdentifier(d.Get("role").(string)),
+				)
+			}
 		}
 
-	case "TABLE", "SEQUENCE", "FUNCTION":
+	case "TABLE":
+		objects := d.Get("objects").(*schema.Set)
+		privileges := d.Get("privileges").(*schema.Set)
+		if objects.Len() > 0 {
+			tablePartitions, err := tablePartitions(db, d)
+			if err != nil {
+				return nil, err
+			}
+			queries = make([]string, len(tablePartitions))
+			for i, p := range tablePartitions {
+				if privileges.Len() > 0 {
+					queries[i] = fmt.Sprintf(
+						"REVOKE %s ON %s %s FROM %s",
+						setToPgIdentSimpleList(privileges),
+						strings.ToUpper(d.Get("object_type").(string)),
+						p,
+						pq.QuoteIdentifier(d.Get("role").(string)),
+					)
+				} else {
+					queries[i] = fmt.Sprintf(
+						"REVOKE ALL PRIVILEGES ON %s %s FROM %s",
+						strings.ToUpper(d.Get("object_type").(string)),
+						p,
+						pq.QuoteIdentifier(d.Get("role").(string)),
+					)
+				}
+			}
+		} else {
+			queries = []string{fmt.Sprintf(
+				"REVOKE ALL PRIVILEGES ON ALL %sS IN SCHEMA %s FROM %s",
+				strings.ToUpper(d.Get("object_type").(string)),
+				pq.QuoteIdentifier(d.Get("schema").(string)),
+				pq.QuoteIdentifier(d.Get("role").(string)),
+			)}
+		}
+
+	case "SEQUENCE", "FUNCTION":
 		objects := d.Get("objects").(*schema.Set)
 		privileges := d.Get("privileges").(*schema.Set)
 		if objects.Len() > 0 {
 			if privileges.Len() > 0 {
-				query = fmt.Sprintf(
+				queries = []string{fmt.Sprintf(
 					"REVOKE %s ON %s %s FROM %s",
 					setToPgIdentSimpleList(privileges),
 					strings.ToUpper(d.Get("object_type").(string)),
 					setToPgIdentList(d.Get("schema").(string), objects),
 					pq.QuoteIdentifier(d.Get("role").(string)),
-				)
+				)}
 			} else {
-				query = fmt.Sprintf(
+				queries = []string{fmt.Sprintf(
 					"REVOKE ALL PRIVILEGES ON %s %s FROM %s",
 					strings.ToUpper(d.Get("object_type").(string)),
 					setToPgIdentList(d.Get("schema").(string), objects),
 					pq.QuoteIdentifier(d.Get("role").(string)),
-				)
+				)}
 			}
 		} else {
-			query = fmt.Sprintf(
+			queries = []string{fmt.Sprintf(
 				"REVOKE ALL PRIVILEGES ON ALL %sS IN SCHEMA %s FROM %s",
 				strings.ToUpper(d.Get("object_type").(string)),
 				pq.QuoteIdentifier(d.Get("schema").(string)),
 				pq.QuoteIdentifier(d.Get("role").(string)),
-			)
+			)}
 		}
 	}
 
-	return query
+	return queries, nil
 }
 
-func grantRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
+func grantRolePrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
 	privileges := []string{}
 	for _, priv := range d.Get("privileges").(*schema.Set).List() {
 		privileges = append(privileges, priv.(string))
@@ -693,17 +779,34 @@ func grantRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
 		return nil
 	}
 
-	query := createGrantQuery(d, privileges)
+	queries, err := createGrantQuery(db, d, privileges)
+	if err != nil {
+		return err
+	}
 
-	_, err := txn.Exec(query)
-	return err
+	for _, query := range queries {
+		_, err := txn.Exec(query)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func revokeRolePrivileges(txn *sql.Tx, d *schema.ResourceData) error {
-	query := createRevokeQuery(d)
-	if _, err := txn.Exec(query); err != nil {
-		return fmt.Errorf("could not execute revoke query: %w", err)
+func revokeRolePrivileges(db *DBConnection, txn *sql.Tx, d *schema.ResourceData) error {
+	queries, err := createRevokeQuery(db, d)
+	if err != nil {
+		return err
 	}
+
+	for _, query := range queries {
+		_, err := txn.Exec(query)
+		if err != nil {
+			return fmt.Errorf("could not execute revoke query: %w", err)
+		}
+	}
+
 	return nil
 }
 

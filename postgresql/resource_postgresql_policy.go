@@ -63,7 +63,8 @@ func resourcePostgreSQLPolicy() *schema.Resource {
 			},
 			policyPathmanPartitionsAttr: {
 				Type:        schema.TypeBool,
-				Required:    false,
+				ForceNew:    true,
+				Optional:    true,
 				Default:     false,
 				Description: "Enable policy propagation to pathman partitions",
 			},
@@ -118,39 +119,6 @@ func resourcePostgreSQLPolicyCreate(db *DBConnection, d *schema.ResourceData) er
 	d.SetId(generatePolicyID(d))
 
 	return resourcePostgreSQLPolicyRead(db, d)
-}
-
-func tablePartitions(db *DBConnection, d *schema.ResourceData) ([]string, error) {
-	policySchema := d.Get(policySchemaAttr).(string)
-	policyTable := d.Get(policyTableAttr).(string)
-	policyPathmanPartitions := d.Get(policyPathmanPartitionsAttr).(bool)
-
-	var tablePartitions []string
-	schemaAndTable := pq.QuoteIdentifier(policySchema) + "." + pq.QuoteIdentifier(policyTable)
-
-	if policyPathmanPartitions {
-		err := db.QueryRow(
-			`SELECT array_agg(p.part) AS tables
-FROM (
-         SELECT $1 AS part
-         UNION ALL
-         SELECT partition AS part
-         FROM pathman_partition_list ppl
-         WHERE ppl.parent = $1::regclass
-     ) p
-         JOIN pg_class pc
-              ON pc.oid = p.part::regclass
-WHERE pc.relkind != 'f'`,
-			schemaAndTable,
-		).Scan(pq.Array(&tablePartitions))
-		switch {
-		case err != nil:
-			return nil, fmt.Errorf("error reading partitions: %w", err)
-		}
-	} else {
-		tablePartitions = append(tablePartitions, schemaAndTable)
-	}
-	return tablePartitions, nil
 }
 
 func resourcePostgreSQLPolicyRead(db *DBConnection, d *schema.ResourceData) error {
@@ -259,7 +227,7 @@ func resourcePostgreSQLPolicyDelete(db *DBConnection, d *schema.ResourceData) er
 
 	for _, partition := range tablePartitions {
 		q := fmt.Sprintf(
-			"DROP POLICY IF EXISTS %s ON %s",
+			"DROP POLICY %s ON %s",
 			pq.QuoteIdentifier(policyName),
 			partition,
 		)

@@ -483,3 +483,50 @@ func pgLockRole(txn *sql.Tx, role string) error {
 
 	return nil
 }
+
+func tablePartitions(db *DBConnection, d *schema.ResourceData) ([]string, error) {
+	policySchema := d.Get(policySchemaAttr).(string)
+
+	var policyTables []string
+
+	var policyTableRaw = d.Get(policyTableAttr)
+	if policyTableRaw == nil {
+		for _, e := range d.Get("objects").(*schema.Set).List() {
+			policyTables = append(policyTables, e.(string))
+		}
+	} else {
+		policyTables = []string{policyTableRaw.(string)}
+	}
+
+	policyPathmanPartitions := d.Get(policyPathmanPartitionsAttr).(bool)
+
+	var tablePartitions []string
+	tablesWithSchema := make([]string, len(policyTables))
+	for i, policyTable := range policyTables {
+		tablesWithSchema[i] = pq.QuoteIdentifier(policySchema) + "." + pq.QuoteIdentifier(policyTable)
+	}
+
+	if policyPathmanPartitions {
+		err := db.QueryRow(
+			`SELECT array_agg(p.part) AS tables
+FROM (
+         SELECT unnest($1::text[]) AS part
+         UNION ALL
+         SELECT partition::text AS part
+         FROM pathman_partition_list ppl
+         WHERE ppl.parent = ANY ($1::regclass[])
+     ) p
+         JOIN pg_class pc
+              ON pc.oid = p.part::regclass
+WHERE pc.relkind != 'f'`,
+			pq.Array(tablesWithSchema),
+		).Scan(pq.Array(&tablePartitions))
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("error reading partitions: %w", err)
+		}
+	} else {
+		tablePartitions = tablesWithSchema
+	}
+	return tablePartitions, nil
+}
