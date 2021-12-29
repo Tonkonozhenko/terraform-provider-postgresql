@@ -1,7 +1,6 @@
 package postgresql
 
 import (
-	"bytes"
 	"database/sql"
 	"fmt"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -11,11 +10,12 @@ import (
 )
 
 const (
-	policyNameAttr   = "name"
-	policySchemaAttr = "schema"
-	policyTableAttr  = "table"
-	policyToAttr     = "to"
-	policyUsingAttr  = "using"
+	policyNameAttr              = "name"
+	policySchemaAttr            = "schema"
+	policyTableAttr             = "table"
+	policyToAttr                = "to"
+	policyUsingAttr             = "using"
+	policyPathmanPartitionsAttr = "pathman_partitions"
 )
 
 func resourcePostgreSQLPolicy() *schema.Resource {
@@ -61,13 +61,17 @@ func resourcePostgreSQLPolicy() *schema.Resource {
 				Required:    true,
 				Description: "Sets the RLS filter",
 			},
+			policyPathmanPartitionsAttr: {
+				Type:        schema.TypeBool,
+				Required:    false,
+				Default:     false,
+				Description: "Enable policy propagation to pathman partitions",
+			},
 		},
 	}
 }
 
 func resourcePostgreSQLPolicyCreate(db *DBConnection, d *schema.ResourceData) error {
-	policySchema := d.Get(policySchemaAttr).(string)
-	policyTable := d.Get(policyTableAttr).(string)
 	policyName := d.Get(policyNameAttr).(string)
 	policyToRaw := d.Get(policyToAttr).([]interface{})
 	policyUsing := d.Get(policyUsingAttr).(string)
@@ -83,28 +87,28 @@ func resourcePostgreSQLPolicyCreate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
-	b1 := bytes.NewBufferString("ALTER TABLE ")
-	fmt.Fprint(b1,
-		pq.QuoteIdentifier(policySchema), ".", pq.QuoteIdentifier(policyTable),
-		" ENABLE ROW LEVEL SECURITY",
-	)
-	if _, err := txn.Exec(b1.String()); err != nil {
+	tablePartitions, err := tablePartitions(db, d)
+	if err != nil {
 		return err
 	}
 
-	b2 := bytes.NewBufferString("CREATE POLICY ")
-	fmt.Fprint(b2,
-		pq.QuoteIdentifier(policyName),
-		" ON ",
-		pq.QuoteIdentifier(policySchema), ".", pq.QuoteIdentifier(policyTable),
-		" TO ",
-		strings.Join(policyTo, ", "), // TODO: quote policyTo
-		" USING (",
-		policyUsing,
-		")",
-	)
-	if _, err := txn.Exec(b2.String()); err != nil {
-		return err
+	for _, partition := range tablePartitions {
+		q1 := fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", partition)
+
+		if _, err := txn.Exec(q1); err != nil {
+			return err
+		}
+
+		q2 := fmt.Sprintf(
+			"CREATE POLICY %s ON %s TO %s USING (%s)",
+			pq.QuoteIdentifier(policyName),
+			partition,
+			strings.Join(policyTo, ", "), // TODO: quote policyTo
+			policyUsing,
+		)
+		if _, err := txn.Exec(q2); err != nil {
+			return err
+		}
 	}
 
 	if err = txn.Commit(); err != nil {
@@ -114,6 +118,39 @@ func resourcePostgreSQLPolicyCreate(db *DBConnection, d *schema.ResourceData) er
 	d.SetId(generatePolicyID(d))
 
 	return resourcePostgreSQLPolicyRead(db, d)
+}
+
+func tablePartitions(db *DBConnection, d *schema.ResourceData) ([]string, error) {
+	policySchema := d.Get(policySchemaAttr).(string)
+	policyTable := d.Get(policyTableAttr).(string)
+	policyPathmanPartitions := d.Get(policyPathmanPartitionsAttr).(bool)
+
+	var tablePartitions []string
+	schemaAndTable := pq.QuoteIdentifier(policySchema) + "." + pq.QuoteIdentifier(policyTable)
+
+	if policyPathmanPartitions {
+		err := db.QueryRow(
+			`SELECT array_agg(p.part) AS tables
+FROM (
+         SELECT $1 AS part
+         UNION ALL
+         SELECT partition AS part
+         FROM pathman_partition_list ppl
+         WHERE ppl.parent = $1::regclass
+     ) p
+         JOIN pg_class pc
+              ON pc.oid = p.part::regclass
+WHERE pc.relkind != 'f'`,
+			schemaAndTable,
+		).Scan(pq.Array(&tablePartitions))
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("error reading partitions: %w", err)
+		}
+	} else {
+		tablePartitions = append(tablePartitions, schemaAndTable)
+	}
+	return tablePartitions, nil
 }
 
 func resourcePostgreSQLPolicyRead(db *DBConnection, d *schema.ResourceData) error {
@@ -149,8 +186,6 @@ func resourcePostgreSQLPolicyRead(db *DBConnection, d *schema.ResourceData) erro
 
 func resourcePostgreSQLPolicyUpdate(db *DBConnection, d *schema.ResourceData) error {
 	policyName := d.Get(policyNameAttr).(string)
-	policySchema := d.Get(policySchemaAttr).(string)
-	policyTable := d.Get(policyTableAttr).(string)
 	policyToRaw := d.Get(policyToAttr).([]interface{})
 	policyUsing := d.Get(policyUsingAttr).(string)
 
@@ -165,36 +200,37 @@ func resourcePostgreSQLPolicyUpdate(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
-	if d.HasChange(policyNameAttr) {
-		policyNameOld, _ := d.GetChange(policyNameAttr)
-
-		b := bytes.NewBufferString("ALTER POLICY ")
-		fmt.Fprint(b,
-			pq.QuoteIdentifier(policyNameOld.(string)),
-			" ON ",
-			pq.QuoteIdentifier(policySchema), ".", pq.QuoteIdentifier(policyTable),
-			" RENAME TO ",
-			pq.QuoteIdentifier(policyName),
-		)
-		if _, err := txn.Exec(b.String()); err != nil {
-			return err
-		}
+	tablePartitions, err := tablePartitions(db, d)
+	if err != nil {
+		return err
 	}
 
-	if d.HasChangeExcept(policyNameAttr) {
-		b := bytes.NewBufferString("ALTER POLICY ")
-		fmt.Fprint(b,
-			pq.QuoteIdentifier(policyName),
-			" ON ",
-			pq.QuoteIdentifier(policySchema), ".", pq.QuoteIdentifier(policyTable),
-			" TO ",
-			strings.Join(policyTo, ", "), // TODO: quote policyTo
-			" USING (",
-			policyUsing,
-			")",
-		)
-		if _, err := txn.Exec(b.String()); err != nil {
-			return err
+	for _, partition := range tablePartitions {
+		if d.HasChange(policyNameAttr) {
+			policyNameOld, _ := d.GetChange(policyNameAttr)
+
+			q := fmt.Sprintf(
+				"ALTER POLICY %s ON %s RENAME TO %s",
+				pq.QuoteIdentifier(policyNameOld.(string)),
+				partition,
+				pq.QuoteIdentifier(policyName),
+			)
+			if _, err := txn.Exec(q); err != nil {
+				return err
+			}
+		}
+
+		if d.HasChangeExcept(policyNameAttr) {
+			q := fmt.Sprintf(
+				"ALTER POLICY %s ON %s TO %s USING (%s)",
+				pq.QuoteIdentifier(policyName),
+				partition,
+				strings.Join(policyTo, ", "), // TODO: quote policyTo
+				policyUsing,
+			)
+			if _, err := txn.Exec(q); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -209,8 +245,6 @@ func resourcePostgreSQLPolicyUpdate(db *DBConnection, d *schema.ResourceData) er
 
 func resourcePostgreSQLPolicyDelete(db *DBConnection, d *schema.ResourceData) error {
 	policyName := d.Get(policyNameAttr).(string)
-	policySchema := d.Get(policySchemaAttr).(string)
-	policyTable := d.Get(policyTableAttr).(string)
 
 	txn, err := startTransaction(db.client, db.client.databaseName)
 	if err != nil {
@@ -218,11 +252,21 @@ func resourcePostgreSQLPolicyDelete(db *DBConnection, d *schema.ResourceData) er
 	}
 	defer deferredRollback(txn)
 
-	b := bytes.NewBufferString("DROP POLICY IF EXISTS ")
-	fmt.Fprint(b, pq.QuoteIdentifier(policyName), " ON ", pq.QuoteIdentifier(policySchema), ".", pq.QuoteIdentifier(policyTable))
-
-	if _, err := txn.Exec(b.String()); err != nil {
+	tablePartitions, err := tablePartitions(db, d)
+	if err != nil {
 		return err
+	}
+
+	for _, partition := range tablePartitions {
+		q := fmt.Sprintf(
+			"DROP POLICY IF EXISTS %s ON %s",
+			pq.QuoteIdentifier(policyName),
+			partition,
+		)
+
+		if _, err := txn.Exec(q); err != nil {
+			return err
+		}
 	}
 
 	if err = txn.Commit(); err != nil {
