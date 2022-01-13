@@ -13,7 +13,7 @@ import (
 	"github.com/lib/pq"
 )
 
-const grantPathmanPartitionsAttr = "pathman_partitions"
+const grantToInheritedAttr = policyPropagateToInheritedAttr
 
 var allowedObjectTypes = []string{
 	"database",
@@ -100,7 +100,7 @@ func resourcePostgreSQLGrant() *schema.Resource {
 				Default:     false,
 				Description: "Permit the grant recipient to grant it to others",
 			},
-			grantPathmanPartitionsAttr: {
+			grantToInheritedAttr: {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				ForceNew:    true,
@@ -479,7 +479,11 @@ GROUP BY pg_proc.proname
 
 	default:
 		query = `
-SELECT pg_class.relname, array_remove(array_agg(privilege_type), NULL)
+SELECT pg_class.relname,
+       CASE
+       WHEN (array_remove(array_agg(privilege_type), NULL) @>
+             ARRAY ['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']) THEN ARRAY ['ALL']
+       ELSE array_remove(array_agg(privilege_type), NULL) END
 FROM pg_class
 JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
 LEFT JOIN (

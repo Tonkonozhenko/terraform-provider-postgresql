@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	policyNameAttr              = "name"
-	policySchemaAttr            = "schema"
-	policyTableAttr             = "table"
-	policyToAttr                = "to"
-	policyUsingAttr             = "using"
-	policyPathmanPartitionsAttr = "pathman_partitions"
+	policyNameAttr                 = "name"
+	policySchemaAttr               = "schema"
+	policyTableAttr                = "table"
+	policyToAttr                   = "to"
+	policyUsingAttr                = "using"
+	policyPropagateToInheritedAttr = "propagate_to_inherited"
 )
 
 func resourcePostgreSQLPolicy() *schema.Resource {
@@ -61,12 +61,12 @@ func resourcePostgreSQLPolicy() *schema.Resource {
 				Required:    true,
 				Description: "Sets the RLS filter",
 			},
-			policyPathmanPartitionsAttr: {
+			policyPropagateToInheritedAttr: {
 				Type:        schema.TypeBool,
 				ForceNew:    true,
 				Optional:    true,
 				Default:     false,
-				Description: "Enable policy propagation to pathman partitions",
+				Description: "Enable policy propagation to inherited tables",
 			},
 		},
 	}
@@ -100,13 +100,29 @@ func resourcePostgreSQLPolicyCreate(db *DBConnection, d *schema.ResourceData) er
 			return err
 		}
 
+		split := strings.Split(partition, ".")
+		partitionSchema, partitionTable := split[0], split[1]
+
 		q2 := fmt.Sprintf(
-			"CREATE POLICY %s ON %s TO %s USING (%s)",
-			pq.QuoteIdentifier(policyName),
-			partition,
+			`DO $$ BEGIN
+			   IF NOT EXISTS (
+				  SELECT *
+					FROM pg_policies
+					WHERE schemaname = '%[1]s'
+					  AND tablename = '%[2]s'
+					  AND policyname = '%[3]s') THEN
+				  CREATE POLICY %[3]s ON %[1]s.%[2]s TO %[4]s
+					  USING (%[5]s);
+			   END IF;
+			END $$`,
+			partitionSchema,
+			partitionTable,
+			policyName,
 			strings.Join(policyTo, ", "), // TODO: quote policyTo
 			policyUsing,
 		)
+		//panic(q2)
+
 		if _, err := txn.Exec(q2); err != nil {
 			return err
 		}

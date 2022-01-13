@@ -498,27 +498,26 @@ func tablePartitions(db *DBConnection, d *schema.ResourceData) ([]string, error)
 		policyTables = []string{policyTableRaw.(string)}
 	}
 
-	policyPathmanPartitions := d.Get(policyPathmanPartitionsAttr).(bool)
+	propagateToInheritedTables := d.Get(policyPropagateToInheritedAttr).(bool)
 
 	var tablePartitions []string
 	tablesWithSchema := make([]string, len(policyTables))
 	for i, policyTable := range policyTables {
-		tablesWithSchema[i] = pq.QuoteIdentifier(policySchema) + "." + pq.QuoteIdentifier(policyTable)
+		tablesWithSchema[i] = policySchema + "." + policyTable
 	}
 
-	if policyPathmanPartitions {
+	if propagateToInheritedTables {
 		err := db.QueryRow(
 			`SELECT array_agg(p.part) AS tables
-FROM (
-         SELECT unnest($1::text[]) AS part
-         UNION ALL
-         SELECT partition::text AS part
-         FROM pathman_partition_list ppl
-         WHERE ppl.parent = ANY ($1::regclass[])
-     ) p
-         JOIN pg_class pc
-              ON pc.oid = p.part::regclass
-WHERE pc.relkind != 'f'`,
+			FROM (
+					 SELECT unnest($1::TEXT[]) AS part
+					 UNION ALL
+					 SELECT inhrelid :: regclass :: TEXT
+					 FROM pg_inherits
+					 WHERE inhparent = ANY ($1::regclass[])
+				 ) p
+					 JOIN pg_class pc ON pc.oid = p.part::regclass
+			WHERE pc.relkind != 'f'`,
 			pq.Array(tablesWithSchema),
 		).Scan(pq.Array(&tablePartitions))
 		switch {
