@@ -94,14 +94,23 @@ func resourcePostgreSQLPolicyCreate(db *DBConnection, d *schema.ResourceData) er
 	}
 
 	for _, partition := range tablePartitions {
-		q1 := fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", partition)
+		split := strings.Split(partition, ".")
+		partitionSchema, partitionTable := split[0], split[1]
+
+		q1 := fmt.Sprintf(`DO $$ BEGIN
+		   IF NOT EXISTS (
+			  SELECT *
+				FROM pg_tables
+				WHERE schemaname = '%[1]s'
+				  AND tablename = '%[2]s'
+				  AND rowsecurity) THEN
+			  ALTER TABLE %[1]s.%[2]s ENABLE ROW LEVEL SECURITY;
+		   END IF;
+		END $$;`, partitionSchema, partitionTable)
 
 		if _, err := txn.Exec(q1); err != nil {
 			return err
 		}
-
-		split := strings.Split(partition, ".")
-		partitionSchema, partitionTable := split[0], split[1]
 
 		q2 := fmt.Sprintf(
 			`DO $$ BEGIN
