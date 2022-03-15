@@ -252,7 +252,7 @@ func resourcePostgreSQLPolicyDelete(db *DBConnection, d *schema.ResourceData) er
 
 	for _, partition := range tablePartitions {
 		q := fmt.Sprintf(
-			"DROP POLICY %s ON %s",
+			"DROP POLICY IF EXISTS %s ON %s",
 			pq.QuoteIdentifier(policyName),
 			partition,
 		)
